@@ -3,11 +3,13 @@ services:
     name: receipt-assistant-poc
     runtime: node
     plan: starter
-    buildCommand: npm ci && npm run build
+    buildCommand: npm install && npm run build
     startCommand: npm run start
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: 22
       - key: HOST
         value: 0.0.0.0
       - key: PORT
