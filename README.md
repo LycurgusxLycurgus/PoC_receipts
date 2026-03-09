@@ -1,8 +1,8 @@
 # Receipt Assistant PoC
 
-Telegram-first bookkeeping intake assistant for Germany.
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/LycurgusxLycurgus/PoC_receipts)
 
-Deepwiki: https://deepwiki.com/LycurgusxLycurgus/PoC_receipts
+Telegram-first bookkeeping intake assistant for Germany.
 
 ## Run
 
