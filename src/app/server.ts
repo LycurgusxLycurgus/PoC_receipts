@@ -21,7 +21,12 @@ app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string
 app.setErrorHandler((error, _request, reply) => {
   const body = errorBody(error);
   const statusCode = error instanceof AppError ? error.statusCode : 500;
-  logger.error("request.failed", { statusCode, code: body.code, message: body.message });
+  logger.error("request.failed", {
+    statusCode,
+    code: body.code,
+    message: body.message,
+    error
+  });
   reply.status(statusCode).send(body);
 });
 
