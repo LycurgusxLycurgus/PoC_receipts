@@ -63,10 +63,22 @@ export function createConversationService(db: Database) {
 
     async saveMessage(conversationId: string, role: "user" | "assistant", content: string, rawJson: unknown, externalId?: string): Promise<string> {
       const id = newId("message");
+
+      if (externalId) {
+        const existing = await db<{ id: string }[]>`
+          select id
+          from messages
+          where external_id = ${externalId}
+          limit 1
+        `;
+        if (existing[0]) {
+          return existing[0].id;
+        }
+      }
+
       await db`
         insert into messages (id, conversation_id, role, external_id, content, raw_json)
         values (${id}, ${conversationId}, ${role}, ${externalId ?? null}, ${content}, ${db.json(rawJson as never)})
-        on conflict (external_id) do nothing
       `;
       return id;
     }

@@ -2,6 +2,8 @@
 
 Telegram-first bookkeeping intake assistant for Germany.
 
+Deepwiki: https://deepwiki.com/LycurgusxLycurgus/PoC_receipts
+
 ## Run
 
 ```bash
