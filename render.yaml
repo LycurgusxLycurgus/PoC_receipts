@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: receipt-assistant-poc
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        fromService:
+          type: web
+          name: receipt-assistant-poc
+          property: port

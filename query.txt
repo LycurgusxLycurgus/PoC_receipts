@@ -1,0 +1,457 @@
+query: 
+
+Here’s the spec I’d hand to an LLM team.
+
+# Receipt Assistant POC — OpenClaw-like backend without OpenClaw
+
+My default recommendation is **not** to build on OpenClaw directly. Instead, build a **single TypeScript monolith** that copies the OpenClaw ideas that matter for this product: one gateway-like process, per-session isolation, prompt assembly on every turn, “bootstrap” context files, and strict tool allowlists. OpenClaw itself is a single persistent gateway that manages sessions, routes messages, and injects workspace files like `AGENTS.md`, `SOUL.md`, `MEMORY.md`, and others into the system prompt each turn; that pattern is the part worth emulating for your prototype. Use **Telegram webhooks** as the only channel in V1, and use the **official Gemini API/SDK** as the runtime instead of treating `gemini-skills` as the product dependency. Gemini 3.1 Flash-Lite Preview is positioned by Google as its most cost-efficient multimodal model for high-volume, lightweight agentic tasks and simple data extraction, which matches this receipt intake use case well. ([DeepWiki][1])
+
+For the database layer, I would choose **Postgres on Render as the default**, not Convex, because your fastest path is “GitHub repo → Render web service + Render Postgres → Telegram webhook works.” Render Blueprints are defined with a `render.yaml` in the repo root, and Render web services must bind to `0.0.0.0` on the expected port. Convex is still a good optional variant later because it provides a database, server functions, scheduling, file storage, and agent/thread primitives, but adding Convex now means adding a second platform before you have proven the flow. ([Render][2])
+
+## One-line product definition
+
+A Telegram-first bookkeeping intake assistant for Germany that captures receipts/invoices/trips, asks exactly the next missing question, saves a canonical record, and lets the user review/export from a small web UI.
+
+## POC success criteria
+
+A good V0 proves only these 5 things:
+
+1. `/start` does micro-onboarding in Telegram.
+2. User sends a receipt photo or invoice PDF.
+3. Gemini extracts structured fields and asks **one** clarification question if needed.
+4. The record is saved with status and visible in a web inbox/month view.
+5. User can export the month as CSV.
+
+Everything else is secondary.
+
+## What we copy from OpenClaw
+
+OpenClaw’s useful architecture patterns for this prototype are:
+
+* **Single gateway process** handling channels and sessions.
+* **Per-session isolation** between conversations.
+* **Prompt assembly per turn**.
+* **Bootstrap context files** injected automatically.
+* **Tool policy / allowlisted tool execution**.
+* **Prompt modes** like “full” vs “minimal.” ([DeepWiki][1])
+
+What we do **not** copy in V0:
+
+* local workspaces on disk
+* multi-channel support beyond Telegram
+* Docker sandboxing
+* root/operator gateway UI
+* OpenClaw plugin ecosystem
+* ACP/subagent complexity
+
+## Core architecture
+
+```text
+Telegram
+  -> POST /webhooks/telegram/:secret
+    -> telegram feature slice
+      -> conversation-orchestrator
+        -> agent-context composer
+        -> gemini runtime
+        -> tool runner
+        -> record service
+        -> export service
+        -> audit log
+      -> Postgres
+      -> Object storage
+      -> Web UI (same app)
+```
+
+Telegram’s Bot API is HTTP-based and supports `setWebhook` for HTTPS POST delivery. Render web services give you a public URL, and a single service can host both the webhook/API and the small web UI. ([Telegram Core][3])
+
+## Default stack
+
+Use one tool per concern:
+
+* **Runtime:** Node 22 + TypeScript
+* **HTTP server:** Fastify
+* **Validation:** Zod
+* **DB:** Postgres
+* **DB access:** Drizzle or plain SQL
+* **LLM:** official Google GenAI SDK
+* **Telegram:** raw Bot API via `fetch`, no bot framework in V0
+* **Storage:** S3-compatible bucket or equivalent
+* **Frontend:** tiny web UI in the same repo/app
+* **Logging:** JSON logs with correlation IDs
+
+Avoid LangChain, workflow engines, queues, and bot frameworks in V0.
+
+## The key design: emulate `AGENTS.md` and friends in the database
+
+Instead of real workspace files, create a table called `context_fragments`:
+
+* `id`
+* `scope_type` = `global | tenant | user | conversation`
+* `scope_id`
+* `kind` = `AGENTS | SOUL | TOOLS | IDENTITY | USER | MEMORY | HEARTBEAT | BOOTSTRAP`
+* `title`
+* `body_markdown`
+* `priority`
+* `active`
+* `updated_at`
+
+Then build `composeContextBundle()` on every turn:
+
+1. base system instruction
+2. active agent fragments for the tenant/user
+3. business profile
+4. current workflow state
+5. last N messages
+6. retrieved memory snippets
+7. current file/document summary
+8. tool list
+
+This mirrors OpenClaw’s per-turn prompt assembly and bootstrap injection model, but stores the fragments in the DB instead of filesystem files. OpenClaw injects bootstrap files like `AGENTS.md`, `SOUL.md`, `MEMORY.md`, etc. on each run, with per-file and total caps, and supports “full” and “minimal” prompt modes. For your prototype, do the same thing with database rows, not files. ([DeepWiki][4])
+
+Also copy one more OpenClaw idea: keep the **stable prompt prefix first**. Gemini’s caching docs say implicit caching is helped by putting large common content at the beginning of the prompt and reusing a similar prefix. So compose the prompt in a deterministic order and keep volatile data later. Explicit caching is optional after V0 if costs start to matter. ([Google AI for Developers][5])
+
+## Prompt modes
+
+Implement only two modes:
+
+* `full`: default for normal user conversations
+* `minimal`: for internal helper calls, retries, and record-only classification
+
+That is enough to emulate the OpenClaw pattern without subagent complexity. ([DeepWiki][4])
+
+## Core database schema
+
+Minimum tables:
+
+* `tenants`
+* `users`
+* `telegram_bindings`
+* `conversations`
+* `messages`
+* `context_fragments`
+* `memory_entries`
+* `uploads`
+* `records`
+* `clarification_tasks`
+* `audit_events`
+* `exports`
+
+### Important table intent
+
+`conversations`
+One row per Telegram chat/thread.
+
+`messages`
+Persistent transcript replacing OpenClaw JSONL sessions.
+
+`context_fragments`
+Database replacement for `AGENTS.md`, `SOUL.md`, `MEMORY.md`, etc.
+
+`memory_entries`
+Durable facts learned about the user/business, separate from raw chat history.
+
+`uploads`
+Original file metadata plus storage key.
+
+`records`
+Canonical receipt/invoice/trip object.
+
+`clarification_tasks`
+Exactly one next question at a time.
+
+`audit_events`
+Everything that matters operationally: inbound update, extraction, tool call, field change, export.
+
+## Canonical record schema
+
+Keep one schema for all record types:
+
+* `record_type`: receipt | invoice | trip | mileage | subscription | reimbursement | other
+* `source_message_id`
+* `upload_id`
+* `vendor`
+* `date`
+* `gross_amount`
+* `net_amount`
+* `vat_amount`
+* `vat_rate`
+* `invoice_number`
+* `origin`
+* `destination`
+* `distance_km`
+* `purpose`
+* `business_use`
+* `category`
+* `client_project`
+* `attendee`
+* `recurring`
+* `reimbursable`
+* `notes`
+* `suggested_category`
+* `deductibility_status`
+* `vat_status`
+* `missing_fields_json`
+* `review_flag`
+* `status`: captured | needs_clarification | ready | finalized | exported
+
+## Message lifecycle
+
+1. Telegram sends an HTTPS webhook update to your service. Use `secret_token` and verify `X-Telegram-Bot-Api-Secret-Token`. ([Telegram Core][3])
+
+2. Normalize the update into your own `InboundMessage` contract.
+
+3. Resolve tenant, user, and conversation.
+
+4. Persist the raw inbound message.
+
+5. If there is media, call `getFile`, download it, and store your own durable copy. Telegram says bots can download files up to 20 MB through `getFile`, and the returned file link is valid for at least 1 hour. That means your Telegram-only V0 should treat files above 20 MB as unsupported via bot and redirect those cases to a web upload flow. ([Telegram Core][3])
+
+6. Build the context bundle.
+
+7. Call Gemini with:
+
+   * system instructions
+   * structured output schema for extraction/classification
+   * function calling for server tools
+   * the uploaded file or file reference
+
+Gemini supports system instructions, structured JSON output, function calling, and file uploads. Structured output is specifically meant for data extraction and structured classification. ([Google AI for Developers][6])
+
+8. Execute only allowlisted tools:
+
+   * `save_onboarding_answer`
+   * `save_record_draft`
+   * `set_next_question`
+   * `finalize_record`
+   * `search_memory`
+   * `save_memory_fact`
+   * `list_open_items`
+   * `create_export`
+
+9. Persist assistant reply, updated record, and audit events.
+
+10. Send Telegram response.
+
+## Gemini runtime strategy
+
+Use the official Google GenAI SDK as the source of truth for implementation. The `gemini-skills` repo is useful as developer guidance, but the runtime should call the Gemini API directly. For V0, I would use:
+
+* primary model: `gemini-3.1-flash-lite-preview`
+* extraction: structured output JSON schema
+* tool loop: function calling
+* files: Gemini Files API only as temporary model-side storage, not as your system of record
+
+Google’s Files API stores files for 48 hours and does not let you download them back, so you still need your own durable object storage. ([GitHub][7])
+
+Because Gemini 3.1 Flash-Lite is preview, keep the model name configurable and support one fallback model in config rather than hard-coding the model everywhere. Google’s release notes explicitly describe it as a newly launched preview model. ([Google AI for Developers][8])
+
+## User-facing web UI
+
+Only build 3 screens in V0:
+
+1. **Inbox / Month view**
+   Table of records with status, category, amount, date, and missing fields.
+
+2. **Settings**
+   Business type, work type, travel frequency, has accountant, language, default VAT assumptions, export preferences.
+
+3. **Exports**
+   CSV download for selected month, plus a basic PDF summary later if time permits.
+
+Users should be able to control only safe settings. Operators only should be able to edit prompt fragments, model config, tool toggles, and replay failed runs.
+
+## Admin/operator controls
+
+Add an internal-only surface for:
+
+* model selection
+* active prompt fragments
+* tool policy
+* prompt preview for a user
+* replay inbound message
+* view audit trail
+* edit categories/rules
+
+Do **not** expose raw system prompts or provider secrets to end users.
+
+## Repository layout
+
+```text
+src/
+  app/
+    server.ts
+    routes.ts
+
+  features/
+    telegram/
+      contract.ts
+      route.ts
+      service.ts
+      telegram-api.ts
+      telegram-api.test.ts
+
+    conversations/
+      contract.ts
+      service.ts
+      repository.ts
+      service.test.ts
+
+    agent-context/
+      contract.ts
+      compose-context.ts
+      fragment-repository.ts
+      memory-repository.ts
+      compose-context.test.ts
+
+    onboarding/
+      contract.ts
+      service.ts
+      tool-handlers.ts
+      service.test.ts
+
+    records/
+      contract.ts
+      extraction.ts
+      classification.ts
+      service.ts
+      repository.ts
+      service.test.ts
+
+    clarifications/
+      contract.ts
+      service.ts
+      service.test.ts
+
+    exports/
+      contract.ts
+      csv.ts
+      service.ts
+      service.test.ts
+
+    settings/
+      contract.ts
+      route.ts
+      service.ts
+
+  infra/
+    config/
+    db/
+    gemini/
+    storage/
+    logger/
+    auth/
+
+  shared/
+    errors.ts
+    ids.ts
+    time.ts
+```
+
+Every feature slice owns its own contract, logic, repository, and tests.
+
+## Boundary contracts
+
+Every route, webhook payload, tool input, and DB write should validate through Zod and return the same error shape:
+
+```json
+{
+  "status": "error",
+  "code": "VALIDATION_ERROR",
+  "message": "Invalid telegram update",
+  "details": {}
+}
+```
+
+## Deployment on Render
+
+Required deployment facts:
+
+* put `render.yaml` in the repo root for Blueprint deployment
+* bind the app to `0.0.0.0`
+* listen on Render’s expected port
+* keep secrets in environment variables
+* set Telegram webhook to the public HTTPS URL after deploy ([Render][2])
+
+Important storage note: Render’s filesystem is ephemeral unless you attach a persistent disk. For the prototype, a persistent disk can work, but the cleaner path is object storage because uploaded receipts are business records and should not depend on local app disk state. ([Render][9])
+
+Environment variables:
+
+* `DATABASE_URL`
+* `GEMINI_API_KEY`
+* `TELEGRAM_BOT_TOKEN`
+* `TELEGRAM_WEBHOOK_SECRET`
+* `APP_BASE_URL`
+* `STORAGE_BUCKET`
+* `STORAGE_REGION`
+* `STORAGE_ACCESS_KEY`
+* `STORAGE_SECRET_KEY`
+* `ADMIN_SECRET`
+
+## Build commands
+
+```bash
+pnpm install --frozen-lockfile
+pnpm dev
+pnpm test
+```
+
+And for production:
+
+```bash
+pnpm build
+pnpm start
+```
+
+## POC acceptance checklist
+
+The build is “done enough” when:
+
+* a new user can onboard in under 2 minutes
+* a Telegram photo receipt becomes a structured record
+* the bot asks only the next missing question
+* the next message resumes the same conversation correctly
+* settings changed in the web UI affect later replies
+* a monthly CSV export works
+* every change is traceable in `audit_events`
+
+## What you probably forgot
+
+These are the missing pieces I would explicitly track at the bottom of the PRD:
+
+* **Durable file storage choice**: S3/R2/B2 vs Render disk
+* **Telegram large-file fallback**: bot downloads are limited to 20 MB, so larger PDFs need web upload
+* **Auth for the web UI**
+* **Operator/admin UI**
+* **Model fallback policy**
+* **Retry/idempotency on webhook handling**
+* **Correlation IDs and structured logging**
+* **Monthly export format expected by the accountant**
+* **German disclaimer language**: assistant suggests, user confirms
+* **Bank/Tink integration**: explicitly deferred
+* **DATEV mapping**: explicitly deferred
+* **Compliance/archive strategy**: explicitly deferred until after usability proof
+
+If you want, I can turn this into a cleaner handoff artifact next: a repo-ready `SPEC.md` plus a first-pass `render.yaml` and `.env.example`.
+
+[1]: https://deepwiki.com/openclaw/openclaw "openclaw/openclaw | DeepWiki"
+[2]: https://render.com/docs/blueprint-spec "Blueprint YAML Reference – Render Docs"
+[3]: https://core.telegram.org/bots/api "Telegram Bot API"
+[4]: https://deepwiki.com/openclaw/openclaw/3.2-system-prompt-and-context "System Prompt & Context | openclaw/openclaw | DeepWiki"
+[5]: https://ai.google.dev/gemini-api/docs/caching "Context caching  |  Gemini API  |  Google AI for Developers"
+[6]: https://ai.google.dev/gemini-api/docs/text-generation "Text generation  |  Gemini API  |  Google AI for Developers"
+[7]: https://github.com/google-gemini/gemini-skills/blob/main/README.md?utm_source=chatgpt.com "gemini-skills/README.md at main"
+[8]: https://ai.google.dev/gemini-api/docs/changelog "Release notes  |  Gemini API  |  Google AI for Developers"
+[9]: https://render.com/docs/disks "Persistent Disks – Render Docs"
+
+
+
+
+
+
+CONTEXT
+
+
+### Part 2: The 80/20 User Flow (The PoC Journey) Here is exactly how a beta tester will experience your PoC on Day 1. **Step 1: Micro-Onboarding (Telegram)** * User opens the Telegram Bot and clicks /start. * **Agent:** "Hallo! I am your Receipt Assistant. Quick setup: Are you a Freelancer or a GmbH?" * **User:** "Freelancer." * **Agent:** "Got it. Do you often take clients out for meals? (Yes/No)" * **User:** "Yes." * **Agent:** "Perfect. Setup complete. Send me your first receipt!" **Step 2: The Magic Capture (The Core Value)** * User snaps a photo of a €52.40 Vapiano receipt and sends it. * **OpenClaw Vision** processes the image. * **Agent (Internal logic):** Detects restaurant, detects amount, detects VAT. Realizes this is a *Bewirtungsbeleg* (hospitality receipt). Realizes the "Attendee/Client" is missing. * **Agent (to User):** "Got the Vapiano receipt (€52.40). Since this is a restaurant, who was the client you met with?" * **User:** "Thomas Müller." * **Agent:** "Thanks! Marked as a business meal with Thomas Müller. 70% deductible. Saved to your monthly canvas." **Step 3: The Monthly Control Room (Web UI)** * User goes to app.receipt-assistant.de. * They see a simple table (The Inbox/Monthly Close view). * **Row 1:** Vapiano | €52.40 | 19% VAT | Category: Business Meal | Status: ✅ Ready. * User clicks **"Export for Steuerberater"** -> Downloads a clean CSV.
+
+
+END CONTEXT
